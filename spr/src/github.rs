@@ -67,6 +67,12 @@ impl PullRequestUpdate {
         }
 
         let body = build_github_body(message);
+        
+        // Normalize empty bodies - treat "\n" and "" as equivalent
+        let local_body_normalized = body.trim();
+        let pr_body_normalized = pull_request.body.as_ref().map(|s| s.trim()).unwrap_or("");
+        
+        if local_body_normalized != pr_body_normalized {
             self.body = Some(body);
         }
     }
