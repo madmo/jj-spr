@@ -668,6 +668,7 @@ mod tests {
             "main".into(),
             "spr/test/".into(),
             false,
+            None,
         )
     }
 

@@ -17,6 +17,7 @@ pub struct Config {
     pub master_ref: GitHubBranch,
     pub branch_prefix: String,
     pub require_approval: bool,
+    pub github_host: Option<String>,
 }
 
 impl Config {
@@ -27,6 +28,7 @@ impl Config {
         master_branch: String,
         branch_prefix: String,
         require_approval: bool,
+        github_host: Option<String>,
     ) -> Self {
         let master_ref =
             GitHubBranch::new_from_branch_name(&master_branch, &remote_name, &master_branch);
@@ -37,12 +39,82 @@ impl Config {
             master_ref,
             branch_prefix,
             require_approval,
+            github_host,
+        }
+    }
+
+    /// Normalize and validate a GitHub host configuration value.
+    /// Returns the base URL with protocol (https:// by default) and strips trailing slashes.
+    fn normalize_github_host(host: &str) -> String {
+        let trimmed = host.trim_end_matches('/');
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            trimmed.to_string()
+        } else {
+            format!("https://{}", trimmed)
+        }
+    }
+
+    /// Extract hostname from a normalized GitHub host URL.
+    /// Returns just the hostname portion without protocol, path, or port.
+    fn extract_hostname(base_url: &str) -> String {
+        base_url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// Check if a normalized base URL is for github.com (not GHE).
+    fn is_github_com(base_url: &str) -> bool {
+        let hostname = Self::extract_hostname(base_url);
+        hostname == "github.com" || hostname == "api.github.com"
+    }
+
+    /// Get the API base URL for REST API calls.
+    /// Returns the base URL with /api/v3 suffix for GHE, or api.github.com for GitHub.com.
+    pub fn api_base_url(&self) -> String {
+        if let Some(host) = &self.github_host {
+            let base = Self::normalize_github_host(host);
+            if Self::is_github_com(&base) {
+                "https://api.github.com".to_string()
+            } else {
+                // Strip any existing /api or /api/v3 suffix to avoid duplication
+                let base_clean = base
+                    .trim_end_matches("/api/v3")
+                    .trim_end_matches("/api");
+                format!("{}/api/v3", base_clean)
+            }
+        } else {
+            "https://api.github.com".to_string()
+        }
+    }
+
+    /// Get the web base URL for constructing PR links.
+    fn web_base_url(&self) -> String {
+        if let Some(host) = &self.github_host {
+            let base = Self::normalize_github_host(host);
+            if Self::is_github_com(&base) {
+                "https://github.com".to_string()
+            } else {
+                // Strip any /api or /api/v3 suffix for web URLs
+                base.trim_end_matches("/api/v3")
+                    .trim_end_matches("/api")
+                    .to_string()
+            }
+        } else {
+            "https://github.com".to_string()
         }
     }
 
     pub fn pull_request_url(&self, number: u64) -> String {
+        let web_base = self.web_base_url();
         format!(
-            "https://github.com/{owner}/{repo}/pull/{number}",
+            "{web_base}/{owner}/{repo}/pull/{number}",
             owner = &self.owner,
             repo = &self.repo
         )
@@ -60,14 +132,26 @@ impl Config {
         }
 
         let regex = lazy_regex::regex!(
-            r#"^\s*https?://github.com/([\w\-\.]+)/([\w\-\.]+)/pull/(\d+)([/?#].*)?\s*$"#
+            r#"^\s*https?://([^/]+)/([\w\-\.]+)/([\w\-\.]+)/pull/(\d+)([/?#].*)?\s*$"#
         );
         let m = regex.captures(text);
-        if let Some(caps) = m
-            && self.owner == caps.get(1).unwrap().as_str()
-            && self.repo == caps.get(2).unwrap().as_str()
-        {
-            return Some(caps.get(3).unwrap().as_str().parse().unwrap());
+        if let Some(caps) = m {
+            let host = caps.get(1).unwrap().as_str();
+            let owner = caps.get(2).unwrap().as_str();
+            let repo = caps.get(3).unwrap().as_str();
+            let number_str = caps.get(4).unwrap().as_str();
+            
+            // Extract expected hostname from config
+            let allowed_host = if let Some(cfg_host) = &self.github_host {
+                let base = Self::normalize_github_host(cfg_host);
+                Self::extract_hostname(&base)
+            } else {
+                "github.com".to_string()
+            };
+
+            if owner == self.owner && repo == self.repo && host == allowed_host {
+                return Some(number_str.parse().unwrap());
+            }
         }
 
         None
@@ -108,6 +192,23 @@ impl Config {
 
     pub fn new_github_branch_from_ref(&self, ghref: &str) -> Result<GitHubBranch> {
         GitHubBranch::new_from_ref(ghref, &self.remote_name, self.master_ref.branch_name())
+    }
+
+    pub fn graphql_endpoint(&self) -> String {
+        if let Some(host) = &self.github_host {
+            let base = Self::normalize_github_host(host);
+            if Self::is_github_com(&base) {
+                "https://api.github.com/graphql".to_string()
+            } else {
+                // Strip any existing /api or /api/v3 suffix to avoid duplication
+                let base_clean = base
+                    .trim_end_matches("/api/v3")
+                    .trim_end_matches("/api");
+                format!("{}/api/graphql", base_clean)
+            }
+        } else {
+            "https://api.github.com/graphql".to_string()
+        }
     }
 
     pub fn new_github_branch(&self, branch_name: &str) -> GitHubBranch {
@@ -229,6 +330,7 @@ mod tests {
             "master".into(),
             "spr/foo/".into(),
             false,
+            None,
         )
     }
 
@@ -399,6 +501,111 @@ mod tests {
         assert_eq!(
             gh.parse_pull_request_field("https://github.com/acme/codez/pull/123#abc"),
             Some(123)
+        );
+    }
+
+    #[test]
+    fn test_hostname_detection_github_com() {
+        let config = crate::config::Config::new(
+            "owner".into(),
+            "repo".into(),
+            "origin".into(),
+            "main".into(),
+            "spr/".into(),
+            false,
+            Some("github.com".into()),
+        );
+        
+        // Should use api.github.com for github.com
+        assert_eq!(config.api_base_url(), "https://api.github.com");
+        assert_eq!(config.graphql_endpoint(), "https://api.github.com/graphql");
+    }
+
+    #[test]
+    fn test_hostname_detection_ghe() {
+        let config = crate::config::Config::new(
+            "owner".into(),
+            "repo".into(),
+            "origin".into(),
+            "main".into(),
+            "spr/".into(),
+            false,
+            Some("ghe.example.com".into()),
+        );
+        
+        // Should use /api/v3 suffix for GHE
+        assert_eq!(config.api_base_url(), "https://ghe.example.com/api/v3");
+        assert_eq!(config.graphql_endpoint(), "https://ghe.example.com/api/graphql");
+    }
+
+    #[test]
+    fn test_hostname_detection_substring_attack() {
+        // Test that "mygithub.com" is NOT treated as github.com
+        let config = crate::config::Config::new(
+            "owner".into(),
+            "repo".into(),
+            "origin".into(),
+            "main".into(),
+            "spr/".into(),
+            false,
+            Some("mygithub.com".into()),
+        );
+        
+        // Should treat as GHE, not as github.com
+        assert_eq!(config.api_base_url(), "https://mygithub.com/api/v3");
+        assert_eq!(config.graphql_endpoint(), "https://mygithub.com/api/graphql");
+    }
+
+    #[test]
+    fn test_api_suffix_stripping() {
+        // Test that /api and /api/v3 suffixes are properly stripped
+        let config1 = crate::config::Config::new(
+            "owner".into(),
+            "repo".into(),
+            "origin".into(),
+            "main".into(),
+            "spr/".into(),
+            false,
+            Some("ghe.example.com/api".into()),
+        );
+        assert_eq!(config1.api_base_url(), "https://ghe.example.com/api/v3");
+        assert_eq!(config1.graphql_endpoint(), "https://ghe.example.com/api/graphql");
+
+        let config2 = crate::config::Config::new(
+            "owner".into(),
+            "repo".into(),
+            "origin".into(),
+            "main".into(),
+            "spr/".into(),
+            false,
+            Some("ghe.example.com/api/v3".into()),
+        );
+        assert_eq!(config2.api_base_url(), "https://ghe.example.com/api/v3");
+        assert_eq!(config2.graphql_endpoint(), "https://ghe.example.com/api/graphql");
+    }
+
+    #[test]
+    fn test_pr_url_parsing_ghe() {
+        let config = crate::config::Config::new(
+            "owner".into(),
+            "repo".into(),
+            "origin".into(),
+            "main".into(),
+            "spr/".into(),
+            false,
+            Some("ghe.example.com".into()),
+        );
+        
+        // Should parse GHE URLs correctly
+        assert_eq!(
+            config.parse_pull_request_field("https://ghe.example.com/owner/repo/pull/123"),
+            Some(123)
+        );
+        
+        // Should reject github.com URLs when configured for GHE
+        assert_eq!(
+            config.parse_pull_request_field("https://github.com/owner/repo/pull/123"),
+            None
         );
     }
 }

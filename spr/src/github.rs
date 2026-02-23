@@ -67,7 +67,6 @@ impl PullRequestUpdate {
         }
 
         let body = build_github_body(message);
-        if pull_request.body.as_ref() != Some(&body) {
             self.body = Some(body);
         }
     }
@@ -158,7 +157,7 @@ impl GitHub {
         };
         let request_body = PullRequestQuery::build_query(variables);
         let res = graphql_client
-            .post("https://api.github.com/graphql")
+            .post(config.graphql_endpoint())
             .json(&request_body)
             .send()
             .await?;
@@ -415,7 +414,7 @@ impl GitHub {
         let request_body = PullRequestMergeabilityQuery::build_query(variables);
         let res = self
             .graphql_client
-            .post("https://api.github.com/graphql")
+            .post(self.config.graphql_endpoint())
             .json(&request_body)
             .send()
             .await?;
@@ -603,5 +602,42 @@ mod tests {
         assert_eq!(r.local(), "refs/remotes/github-remote/refs/heads/foo");
         assert_eq!(r.branch_name(), "refs/heads/foo");
         assert!(!r.is_master_branch());
+    }
+
+    #[test]
+    fn test_update_message_empty_body_equivalence() {
+        use crate::message::{MessageSection, MessageSectionsMap, build_github_body};
+        
+        // Test that empty body "" and single newline "\n" are treated as equivalent
+        let mut message: MessageSectionsMap = std::collections::BTreeMap::new();
+        message.insert(MessageSection::Title, "Test Title".to_string());
+        message.insert(MessageSection::Summary, "".to_string());  // Empty summary
+        // Empty Summary section means body will be "\n"
+        
+        let body = build_github_body(&message);
+        assert_eq!(body, "\n", "Empty summary should produce single newline");
+        
+        // Create a mock PR with empty body
+        let pr = PullRequest {
+            number: 1,
+            state: PullRequestState::Open,
+            title: "Test Title".to_string(),
+            body: Some("".to_string()),  // Empty body from GitHub
+            sections: message.clone(),
+            base: GitHubBranch::new_from_branch_name("main", "origin", "main"),
+            head: GitHubBranch::new_from_branch_name("feature", "origin", "main"),
+            base_oid: git2::Oid::zero(),
+            head_oid: git2::Oid::zero(),
+            merge_commit: None,
+            reviewers: std::collections::HashMap::new(),
+            review_status: None,
+        };
+        
+        let mut updates = PullRequestUpdate::default();
+        updates.update_message(&pr, &message);
+        
+        // Should not detect a difference between "" and "\n"
+        assert!(updates.body.is_none(), "Empty body should not trigger update");
+        assert!(updates.is_empty(), "No updates should be needed");
     }
 }

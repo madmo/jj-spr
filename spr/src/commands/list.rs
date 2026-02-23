@@ -29,7 +29,7 @@ pub async fn list(graphql_client: reqwest::Client, config: &crate::config::Confi
     };
     let request_body = SearchQuery::build_query(variables);
     let res = graphql_client
-        .post("https://api.github.com/graphql")
+        .post(config.graphql_endpoint())
         .json(&request_body)
         .send()
         .await?;

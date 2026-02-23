@@ -85,18 +85,11 @@ pub async fn init() -> Result<()> {
         pat
     };
 
-    let octocrab = octocrab::OctocrabBuilder::default()
-        .personal_token(pat.clone())
-        .build()?;
-    let github_user = octocrab.current().user().await?;
-
-    output("👋", &formatdoc!("Hello {}!", github_user.login))?;
-
     if !reuse_token {
         set_jj_config("spr.githubAuthToken", pat.as_str(), &path)?;
     }
 
-    // Name of remote
+    // Name of remote (ask before authentication so we can detect GHE)
 
     console::Term::stdout().write_line("")?;
 
@@ -119,6 +112,105 @@ pub async fn init() -> Result<()> {
         .interact_text()?;
     set_jj_config("spr.githubRemoteName", &remote, &path)?;
 
+    // Check if this might be GitHub Enterprise by looking at the URL
+    let url = repo.find_remote(&remote)?.url().map(String::from);
+    let is_github_com = url.as_ref().map(|u| u.contains("github.com")).unwrap_or(true);
+    
+    let detected_host = if !is_github_com {
+        // Extract host from remote URL for GHE
+        let host_regex = lazy_regex::regex!(r#"(?:https?://|git@)([^/:]+)[/:]"#);
+        url.as_ref()
+            .and_then(|url| host_regex.captures(url))
+            .and_then(|caps| caps.get(1))
+            .map(|m| m.as_str().to_string())
+    } else {
+        None
+    };
+
+    // GitHub Enterprise host (ask early if detected)
+    let configured_github_host = if let Some(detected_host) = detected_host {
+        console::Term::stdout().write_line("")?;
+        output(
+            "❓",
+            &formatdoc!(
+                "It looks like you might be using GitHub Enterprise. If so, \
+                 please enter the hostname (e.g., github.example.com). Leave \
+                 empty if you're using GitHub.com."
+            ),
+        )?;
+
+        let github_host_input = dialoguer::Input::<String>::new()
+            .with_prompt("GitHub Enterprise hostname (optional)")
+            .with_initial_text(detected_host)
+            .allow_empty(true)
+            .validate_with(|input: &String| -> std::result::Result<(), String> {
+                if input.is_empty() {
+                    return Ok(());
+                }
+                
+                // Basic validation: ensure it looks like a valid hostname or URL
+                let normalized = if input.starts_with("http://") || input.starts_with("https://") {
+                    input.clone()
+                } else {
+                    format!("https://{}", input)
+                };
+                
+                // Check if it's a valid URL structure
+                if normalized.contains("://") {
+                    let parts: Vec<&str> = normalized.splitn(2, "://").collect();
+                    if parts.len() == 2 {
+                        let after_scheme = parts[1];
+                        // Must have a hostname (something before / or end of string)
+                        if after_scheme.is_empty() || after_scheme.starts_with('/') {
+                            return Err("Invalid hostname: missing hostname after protocol".to_string());
+                        }
+                        // Basic hostname validation: no spaces, must have at least one character
+                        if after_scheme.split('/').next().unwrap_or("").contains(' ') {
+                            return Err("Invalid hostname: contains spaces".to_string());
+                        }
+                    }
+                }
+                
+                Ok(())
+            })
+            .interact_text()?;
+
+        if !github_host_input.is_empty() {
+            set_jj_config("spr.githubHost", &github_host_input, &path)?;
+            Some(github_host_input)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Now rebuild octocrab with GHE configuration if needed
+    let octocrab = {
+        let mut builder = octocrab::OctocrabBuilder::default().personal_token(pat.clone());
+        
+        if let Some(host) = &configured_github_host {
+            // Use Config helper for consistent API URL construction
+            let temp_config = crate::config::Config::new(
+                "temp".to_string(),
+                "temp".to_string(),
+                "origin".to_string(),
+                "main".to_string(),
+                "spr/".to_string(),
+                false,
+                Some(host.clone()),
+            );
+            let base_api = temp_config.api_base_url();
+            builder = builder.base_uri(base_api)?;
+        }
+        
+        builder.build()?
+    };
+
+    let github_user = octocrab.current().user().await?;
+
+    output("👋", &formatdoc!("Hello {}!", github_user.login))?;
+
     // Name of the GitHub repo
 
     console::Term::stdout().write_line("")?;
@@ -132,8 +224,8 @@ pub async fn init() -> Result<()> {
         ),
     )?;
 
-    let url = repo.find_remote(&remote)?.url().map(String::from);
     let regex = lazy_regex::regex!(r#"github\.com[/:]([\w\-\.]+/[\w\-\.]+?)(.git)?$"#);
+    
     let github_repo = config
         .get_string("spr.githubRepository")
         .ok()
@@ -152,7 +244,7 @@ pub async fn init() -> Result<()> {
         .interact_text()?;
     set_jj_config("spr.githubRepository", &github_repo, &path)?;
 
-    // Master branch name (just query GitHub)
+    // Master branch name (query GitHub using configured octocrab)
 
     let github_repo_info = octocrab
         .get::<octocrab::models::Repository, _, _>(format!("/repos/{}", &github_repo), None::<&()>)
